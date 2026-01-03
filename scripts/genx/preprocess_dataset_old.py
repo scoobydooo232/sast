@@ -915,8 +915,6 @@ if __name__ == '__main__':
             }
             seq_data_list.append(sequence_data)
 
-    print(seq_data_list)
-
     ev_repr_num_events = None
     ev_repr_delta_ts_ms = None
     if config.event_window_extraction.method == AggregationType.COUNT:

@@ -15,8 +15,20 @@ from multiprocessing import get_context
 from pathlib import Path
 import shutil
 import sys
+from DatEventReader import DatEventReader
 
 sys.path.append('../..')
+import sys
+from pathlib import Path
+
+# Add the toolbox root directory to Python's search path
+toolbox_path = Path('/workspace/Event-Gen1-ToolBox')
+if str(toolbox_path) not in sys.path:
+    sys.path.append(str(toolbox_path))
+
+# Import via 'src' to avoid conflict with Python's built-in 'io' module
+from src.io.psee_loader import PSEELoader
+
 from typing import Any, Dict, List, Optional, Tuple, Union
 import weakref
 
@@ -187,7 +199,87 @@ class H5Reader:
         )
         return ev_data
 
+# L: gpt generated wrapper class for psee_loader
+class DatReader:
+    def __init__(self, dat_file: Path, dataset: str = 'gen4'):
+        assert dat_file.exists()
+        # Initialize the provided PSEELoader
+        self.loader = PSEELoader(str(dat_file))
+        self.is_open = True
+        
+        # Cache for all events to allow random access (mimicking H5 behavior)
+        # We need this because your script does np.searchsorted on the whole time array
+        self._all_events = None 
+        self._all_ts = None
+        print("DAT READER INITIALISED")
 
+        # Handle resolution
+        h, w = self.loader.get_size()
+        if h is None or w is None:
+            self.height = dataset_2_height[dataset]
+            self.width = dataset_2_width[dataset]
+        else:
+            self.height = h
+            self.width = w
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def close(self):
+        # PSEELoader closes file in __del__, but we can explicitly clear memory
+        del self.loader
+        self.is_open = False
+
+    def get_height_and_width(self) -> Tuple[int, int]:
+        return self.height, self.width
+
+    def _load_all_to_memory(self):
+        """
+        DAT files are streams, but the preprocessing script requires 
+        random access and full time arrays. We load the file once.
+        """
+        if self._all_events is None:
+            self.loader.reset()
+            count = self.loader.event_count()
+            # Load all events at once
+            self._all_events = self.loader.load_n_events(count)
+            # Cache timestamps specifically for the .time property
+            self._all_ts = self._all_events['t'].astype(np.int64)
+
+    @property
+    def time(self) -> np.ndarray:
+        assert self.is_open
+        self._load_all_to_memory()
+        return self._all_ts
+
+    def get_event_slice(self, idx_start: int, idx_end: int, convert_2_torch: bool = True):
+        assert self.is_open
+        assert idx_end >= idx_start
+        
+        self._load_all_to_memory()
+        
+        # Extract from cached memory
+        chunk = self._all_events[idx_start:idx_end]
+        
+        # Extract individual fields
+        x_array = chunk['x'].astype(np.int64)
+        y_array = chunk['y'].astype(np.int64)
+        p_array = chunk['p'].astype(np.int64)
+        t_array = chunk['t'].astype(np.int64)
+
+        print("get event slice in DatReader")
+        ev_data = dict(
+            x=x_array if not convert_2_torch else torch.from_numpy(x_array),
+            y=y_array if not convert_2_torch else torch.from_numpy(y_array),
+            p=p_array if not convert_2_torch else torch.from_numpy(p_array),
+            t=t_array if not convert_2_torch else torch.from_numpy(t_array),
+            height=self.height,
+            width=self.width,
+        )
+        return ev_data
 def prophesee_bbox_filter(labels: np.ndarray, dataset_type: str) -> np.ndarray:
     assert dataset_type in {'gen1', 'gen4'}
 
@@ -472,6 +564,14 @@ def downsample_ev_repr(x: torch.Tensor, scale_factor: float):
         x = torch.asarray(x - 128, dtype=torch.int8)
     return x
 
+# adding get_reader function
+def get_reader(file_path: Path, dataset: str):
+    if file_path.suffix == '.h5':
+        return H5Reader(file_path, dataset=dataset)
+    elif file_path.suffix == '.dat':
+        return DatReader(file_path, dataset=dataset)
+    else:
+        raise ValueError(f"Unsupported file extension: {file_path.suffix}")
 
 def write_event_representations(in_h5_file: Path,
                                 ev_out_dir: Path,
@@ -492,17 +592,27 @@ def write_event_representations(in_h5_file: Path,
     if downsample_by_2:
         ev_repr_shape = ev_repr_shape[0], ev_repr_shape[1] // 2, ev_repr_shape[2] // 2
     ev_repr_dtype = event_representation.get_numpy_dtype()
-    with H5Reader(in_h5_file, dataset=dataset) as h5_reader, \
+    
+    # with H5Reader(in_h5_file, dataset=dataset) as h5_reader, \
+    #         H5Writer(ev_outfile_in_progress,
+    #                  key='data',
+    #                  ev_repr_shape=ev_repr_shape,
+    #                  numpy_dtype=ev_repr_dtype) as h5_writer:
+    #     height, width = h5_reader.get_height_and_width()
+
+    with get_reader(in_h5_file, dataset=dataset) as event_reader, \
             H5Writer(ev_outfile_in_progress,
                      key='data',
                      ev_repr_shape=ev_repr_shape,
                      numpy_dtype=ev_repr_dtype) as h5_writer:
-        height, width = h5_reader.get_height_and_width()
+                     
+        height, width = event_reader.get_height_and_width()
+                
         if downsample_by_2:
             assert (height // 2, width // 2) == ev_repr_shape[-2:]
         else:
             assert (height, width) == ev_repr_shape[-2:]
-        ev_ts_us = h5_reader.time
+        ev_ts_us = event_reader.time
 
         end_indices = np.searchsorted(ev_ts_us, ev_repr_timestamps_us, side='right')
         if ev_repr_num_events is not None:
@@ -512,7 +622,7 @@ def write_event_representations(in_h5_file: Path,
             start_indices = np.searchsorted(ev_ts_us, ev_repr_timestamps_us - ev_repr_delta_ts_ms * 1000, side='left')
 
         for idx_start, idx_end in zip(start_indices, end_indices):
-            ev_window = h5_reader.get_event_slice(idx_start=idx_start, idx_end=idx_end)
+            ev_window = event_reader.get_event_slice(idx_start=idx_start, idx_end=idx_end)
 
             ev_repr = event_representation.construct(x=ev_window['x'],
                                                      y=ev_window['y'],
@@ -736,17 +846,46 @@ if __name__ == '__main__':
     for split in [train_path, val_path, test_path]:
         split_out_dir = target_dir / split.name
         os.makedirs(split_out_dir, exist_ok=True)
+        # for npy_file in split.iterdir():
+        #     if npy_file.suffix != '.npy':
+        #         continue
+        #     h5f_path = npy_file.parent / (
+        #             # npy_file.stem.split('bbox')[0] + f"td{'.dat' if dataset == 'gen1' else ''}.h5")
+        #         npy_file.stem.split('bbox')[0] + f"td.dat")
+        #     # assert h5f_path.exists(), f'{h5f_path=}'
+
+        #     if not h5f_path.exists():
+        #         # Optional: Print a warning if you want to know which files are skipped
+        #         print(f"Skipping {h5f_path}: Paired H5 file not found.")
+                
+        #         continue
         for npy_file in split.iterdir():
             if npy_file.suffix != '.npy':
                 continue
-            h5f_path = npy_file.parent / (
-                    npy_file.stem.split('bbox')[0] + f"td{'.dat' if dataset == 'gen1' else ''}.h5")
-            # assert h5f_path.exists(), f'{h5f_path=}'
-
-            if not h5f_path.exists():
-                # Optional: Print a warning if you want to know which files are skipped
-                print(f"Skipping {npy_file.name}: Paired H5 file not found.")
+        
+            # Clean up the file stem logic to remove _bbox
+            base_stem = npy_file.stem.split('_bbox')[0]
+            
+            # 1. Try to find H5
+            h5f_path = npy_file.parent / (base_stem + f"td{'.dat' if dataset == 'gen1' else ''}.dat")  #changed .h5 to .dat --sarvesh 27/12/25
+            
+            # 2. If H5 doesn't exist, try to find DAT
+            input_event_file = h5f_path
+            if not input_event_file.exists():
+                # Construct DAT path (usually just .dat extension)
+                dat_path = npy_file.parent / (base_stem + "_td.dat")
+                if dat_path.exists():
+                    input_event_file = dat_path
+                else:
+                    # Check for alternative naming (sometimes just .dat without _td)
+                    dat_path_alt = npy_file.parent / (base_stem + ".dat")
+                    if dat_path_alt.exists():
+                        input_event_file = dat_path_alt
+        
+            if not input_event_file.exists():
+                print(f"Skipping {npy_file.name}: Paired event file (h5 or dat) not found.")
                 continue
+        
             dir_name = npy_file.stem.split('_bbox')[0]
             if dir_name in dirs_to_ignore[dataset]:
                 continue
@@ -759,14 +898,24 @@ if __name__ == '__main__':
             out_ev_repr_path = out_ev_repr_parent_path / ev_repr_string
             os.makedirs(out_ev_repr_path, exist_ok=True)
 
+            # sequence_data = {
+            #     DataKeys.InNPY: npy_file,
+            #     DataKeys.InH5: h5f_path,
+            #     DataKeys.OutLabelDir: out_labels_path,
+            #     DataKeys.OutEvReprDir: out_ev_repr_path,
+            #     DataKeys.SplitType: split_name_2_type[split.name],
+            # }
+
             sequence_data = {
                 DataKeys.InNPY: npy_file,
-                DataKeys.InH5: h5f_path,
+                DataKeys.InH5: input_event_file, # This key maps to either .h5 or .dat now
                 DataKeys.OutLabelDir: out_labels_path,
                 DataKeys.OutEvReprDir: out_ev_repr_path,
                 DataKeys.SplitType: split_name_2_type[split.name],
             }
             seq_data_list.append(sequence_data)
+
+    print(seq_data_list)
 
     ev_repr_num_events = None
     ev_repr_delta_ts_ms = None
