@@ -199,20 +199,25 @@ class H5Reader:
         )
         return ev_data
 
-# L: gpt generated wrapper class for psee_loader
+import gc
+import numpy as np
+import torch
+from pathlib import Path
+from typing import Tuple
+
 class DatReader:
     def __init__(self, dat_file: Path, dataset: str = 'gen4'):
         assert dat_file.exists()
-        # Initialize the provided PSEELoader
         self.loader = PSEELoader(str(dat_file))
         self.is_open = True
         
-        # Cache for all events to allow random access (mimicking H5 behavior)
-        # We need this because your script does np.searchsorted on the whole time array
-        self._all_events = None 
+        # We will ONLY load timestamps into memory (approx 3GB for a large file)
+        # We will NOT load x, y, p arrays (saving ~10GB)
         self._all_ts = None
-        print("DAT READER INITIALISED")
-
+        
+        # Track where the file pointer currently is
+        self._current_idx = 0
+        
         # Handle resolution
         h, w = self.loader.get_size()
         if h is None or w is None:
@@ -221,6 +226,8 @@ class DatReader:
         else:
             self.height = h
             self.width = w
+            
+        print(f"DAT STREAMER INITIALISED: {dat_file.name}")
 
     def __enter__(self):
         return self
@@ -229,48 +236,96 @@ class DatReader:
         self.close()
 
     def close(self):
-        # PSEELoader closes file in __del__, but we can explicitly clear memory
-        del self.loader
+        # Explicitly release the timestamp array
+        if self._all_ts is not None:
+            del self._all_ts
+            self._all_ts = None
+            
+        if hasattr(self, 'loader'):
+            del self.loader
+            
         self.is_open = False
+        
+        # Force garbage collection immediately
+        gc.collect()
 
     def get_height_and_width(self) -> Tuple[int, int]:
         return self.height, self.width
 
-    def _load_all_to_memory(self):
+    def _load_timestamps_only(self):
         """
-        DAT files are streams, but the preprocessing script requires 
-        random access and full time arrays. We load the file once.
+        Efficiently loads ONLY timestamps into memory.
         """
-        if self._all_events is None:
-            self.loader.reset()
-            count = self.loader.event_count()
-            # Load all events at once
-            self._all_events = self.loader.load_n_events(count)
-            # Cache timestamps specifically for the .time property
-            self._all_ts = self._all_events['t'].astype(np.int64)
+        if self._all_ts is not None:
+            return
+
+        print("Indexing timestamps (this may take a moment)...")
+        self.loader.reset()
+        
+        # 1. Pre-allocate memory if possible to avoid spikes
+        total_count = self.loader.event_count()
+        if total_count > 0:
+            self._all_ts = np.empty(total_count, dtype=np.int64)
+            
+            # Read in chunks to fill the array
+            chunk_size = 50_000_000 
+            start = 0
+            while start < total_count:
+                # Load chunk
+                end = min(start + chunk_size, total_count)
+                # We interpret just the 't' field from the structured array/dict
+                chunk = self.loader.load_n_events(end - start)
+                self._all_ts[start:end] = chunk['t'].astype(np.int64)
+                start = end
+        else:
+            # Fallback if count is unknown (slower, higher memory peak)
+            ts_list = []
+            while not self.loader.done():
+                chunk = self.loader.load_n_events(10_000_000)
+                if len(chunk) == 0: break
+                ts_list.append(chunk['t'].astype(np.int64))
+            self._all_ts = np.concatenate(ts_list)
+
+        # Reset loader so we can start streaming data later
+        self.loader.reset()
+        self._current_idx = 0
 
     @property
     def time(self) -> np.ndarray:
         assert self.is_open
-        self._load_all_to_memory()
+        self._load_timestamps_only()
         return self._all_ts
 
     def get_event_slice(self, idx_start: int, idx_end: int, convert_2_torch: bool = True):
         assert self.is_open
         assert idx_end >= idx_start
         
-        self._load_all_to_memory()
+        if self._all_ts is None:
+            self._load_timestamps_only()
+
+        # Manage File Pointer
+        # If we are asked for an earlier index, we must reset (rewind)
+        if idx_start < self._current_idx:
+            self.loader.reset()
+            self._current_idx = 0
         
-        # Extract from cached memory
-        chunk = self._all_events[idx_start:idx_end]
-        
-        # Extract individual fields
+        # If we are behind, skip forward
+        if idx_start > self._current_idx:
+            skip = idx_start - self._current_idx
+            self.loader.load_n_events(skip)
+            self._current_idx += skip
+            
+        # Now read the actual data
+        count = idx_end - idx_start
+        chunk = self.loader.load_n_events(count)
+        self._current_idx += len(chunk)
+
+        # Extract columns
         x_array = chunk['x'].astype(np.int64)
         y_array = chunk['y'].astype(np.int64)
         p_array = chunk['p'].astype(np.int64)
         t_array = chunk['t'].astype(np.int64)
 
-        print("get event slice in DatReader")
         ev_data = dict(
             x=x_array if not convert_2_torch else torch.from_numpy(x_array),
             y=y_array if not convert_2_torch else torch.from_numpy(y_array),
@@ -280,6 +335,90 @@ class DatReader:
             width=self.width,
         )
         return ev_data
+
+
+# # L: gpt generated wrapper class for psee_loader
+# class DatReader:
+#     def __init__(self, dat_file: Path, dataset: str = 'gen4'):
+#         assert dat_file.exists()
+#         # Initialize the provided PSEELoader
+#         self.loader = PSEELoader(str(dat_file))
+#         self.is_open = True
+        
+#         # Cache for all events to allow random access (mimicking H5 behavior)
+#         # We need this because your script does np.searchsorted on the whole time array
+#         self._all_events = None 
+#         self._all_ts = None
+#         print("DAT READER INITIALISED")
+
+#         # Handle resolution
+#         h, w = self.loader.get_size()
+#         if h is None or w is None:
+#             self.height = dataset_2_height[dataset]
+#             self.width = dataset_2_width[dataset]
+#         else:
+#             self.height = h
+#             self.width = w
+
+#     def __enter__(self):
+#         return self
+
+#     def __exit__(self, exc_type, exc_val, exc_tb):
+#         self.close()
+
+#     def close(self):
+#         # PSEELoader closes file in __del__, but we can explicitly clear memory
+#         del self.loader
+#         self.is_open = False
+
+#     def get_height_and_width(self) -> Tuple[int, int]:
+#         return self.height, self.width
+
+#     def _load_all_to_memory(self):
+#         """
+#         DAT files are streams, but the preprocessing script requires 
+#         random access and full time arrays. We load the file once.
+#         """
+#         if self._all_events is None:
+#             self.loader.reset()
+#             count = self.loader.event_count()
+#             # Load all events at once
+#             self._all_events = self.loader.load_n_events(count)
+#             # Cache timestamps specifically for the .time property
+#             self._all_ts = self._all_events['t'].astype(np.int64)
+
+#     @property
+#     def time(self) -> np.ndarray:
+#         assert self.is_open
+#         self._load_all_to_memory()
+#         return self._all_ts
+
+#     def get_event_slice(self, idx_start: int, idx_end: int, convert_2_torch: bool = True):
+#         assert self.is_open
+#         assert idx_end >= idx_start
+        
+#         self._load_all_to_memory()
+        
+#         # Extract from cached memory
+#         chunk = self._all_events[idx_start:idx_end]
+        
+#         # Extract individual fields
+#         x_array = chunk['x'].astype(np.int64)
+#         y_array = chunk['y'].astype(np.int64)s
+#         p_array = chunk['p'].astype(np.int64)
+#         t_array = chunk['t'].astype(np.int64)
+
+#         print("get event slice in DatReader")
+#         ev_data = dict(
+#             x=x_array if not convert_2_torch else torch.from_numpy(x_array),
+#             y=y_array if not convert_2_torch else torch.from_numpy(y_array),
+#             p=p_array if not convert_2_torch else torch.from_numpy(p_array),
+#             t=t_array if not convert_2_torch else torch.from_numpy(t_array),
+#             height=self.height,
+#             width=self.width,
+#         )
+#         return ev_data
+
 def prophesee_bbox_filter(labels: np.ndarray, dataset_type: str) -> np.ndarray:
     assert dataset_type in {'gen1', 'gen4'}
 

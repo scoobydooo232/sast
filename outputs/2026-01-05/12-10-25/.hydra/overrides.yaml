@@ -1,0 +1,7 @@
+- dataset=gen4
+- dataset.path='/workspace/final_dataset_1'
+- checkpoint='/workspace/sast_step.ckpt'
+- use_test_set=0
+- hardware.gpus=0
+- batch_size.eval=4
+- +experiment/gen4=base

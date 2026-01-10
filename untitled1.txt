@@ -4,6 +4,17 @@ python -m pip install pytorch-lightning==1.8.6 wandb==0.14.0 pandas==1.5.3 plotl
 
 DATA_DIR=/workspace/dataset CKPT_PATH=/workspace/sast_step.ckpt USE_TEST=0 GPU_ID=0 DEST_DIR=/workspace/final_dataset_1
 
-NUM_PROCESSES=20  # set to the number of parallel processes to use
+NUM_PROCESSES=5  # set to the number of parallel processes to use
 python preprocess_dataset.py ${DATA_DIR} ${DEST_DIR} conf_preprocess/representation/stacked_hist.yaml \
 conf_preprocess/extraction/const_duration.yaml conf_preprocess/filter_gen4.yaml -ds gen4 -np ${NUM_PROCESSES}
+
+
+python validation.py \
+    dataset=gen4 \
+    dataset.path="'${DEST_DIR}'" \
+    checkpoint="'${CKPT_PATH}'" \
+    use_test_set="${USE_TEST}" \
+    hardware.gpus="${GPU_ID}" \
+    batch_size.eval=4 \
+    hardware.num_workers.eval=0 \
+    +experiment/gen4=base

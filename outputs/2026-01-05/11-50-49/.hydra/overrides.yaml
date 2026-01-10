@@ -1,0 +1,3 @@
+- dataset=gen4
+- dataset.path=/workspace/final_dataset_1
+- checkpoint=/workspace/sast_step.ckpt
